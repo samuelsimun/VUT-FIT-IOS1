@@ -1,0 +1,738 @@
+#!/bin/bash
+
+POSIXLY_CORRECT=yes
+
+shopt -s lastpipe
+set +m
+
+START_DAY='2018-02-02'
+END_DAY=$(date +"%Y-%m-%d")
+GENDER="all"
+WIDTH=-1
+GRAPH=false
+COMMAND=""
+SOURCE=("")
+date_value=""
+dates=""
+previous_date=""
+
+
+#Exiting with error status for fatal error during run of script
+usage_error(){
+  >&2 echo "Error with $1"
+  exit 99
+}
+
+#Showing help for user for understand options for a script
+print_help(){
+     echo "Script analise given file and give statistics about infection"
+     echo
+     echo "Syntax: corona [OPTIONS] [COMMAND] [LOG [LOG2 [...]]"
+     echo "OPTIONS:"
+     echo "-a <YYYY-mm-dd>>    =  Set a date, only records after this date ( including this date) are considered"
+     echo "-b <YYYY-mm-dd>>    =  Set a date, only records before this date (including this date) are considered"
+     echo "-g <M/Z>            =  Only records of infected persons of a given gender are considered."
+     echo "-s [width]          =  Use with command -> gender, age, daily, monthly, yearly, countries, districts, regions. Print data in graph."
+     echo "-h                  =  Show this help"
+     echo
+     echo
+     echo "COMMAND:"
+     echo "infected            = Count number of infected"
+     echo "merge               = Merge all Logs on input to one log, the order will be maintained"
+     echo "gender              = Print number of infected by gender"
+     echo "age                 = Print statistic of infected by age"
+     echo "daily               = Print statistic of infected for each day"
+     echo "monthly             = Print statistic of infected for each month"
+     echo "yearly              = Print statistic of infected for each year"
+     echo "countries           = Print statistic of infected for each country without CZECH "
+     echo "districts           = Print statistic of infected for each districts"
+     echo "regions             = Print statistic of infected for each regions"
+
+     exit;
+}
+
+#Getting LOGS from arguments and decompressing them
+get_source(){
+  local i=0
+  while (( "$#" )); do
+    [ ! -r $1 ] && usage_error "File"
+    SOURCE[$i]=$1
+    ((i++))
+    shift
+  done
+}
+
+#Getting command from argument
+get_command(){
+
+  # If number of arguments = 0
+  if [ "$1" = "" ]; then
+    COMMAND="merge"
+    return
+  fi
+
+  case $1 in
+    infected)
+      COMMAND="infected"
+      shift
+      ;;
+    merge)
+      COMMAND="merge"
+      shift
+      ;;
+    gender)
+      COMMAND="gender"
+      shift
+      ;;
+    age)
+      COMMAND="age"
+      shift
+      ;;
+    daily)
+      COMMAND="daily"
+      shift
+      ;;
+    monthly)
+      COMMAND="monthly"
+      shift
+      ;;
+    yearly)
+      COMMAND="yearly"
+      shift
+      ;;
+    countries)
+      COMMAND="countries"
+      shift
+      ;;
+    districts)
+      COMMAND="districts"
+      shift
+      ;;
+    regions)
+      COMMAND="regions"
+      shift
+      ;;
+    *)
+      if [[ "$1" = *".bz2" ]] || [[ "$1" = *".gz" ]] || [[ "$1" = *".csv" ]] ; then
+        COMMAND=""
+      else
+        usage_error "command"
+      fi
+      ;;
+  esac
+  get_source "$@"
+}
+
+#Getting switches
+get_swtiches(){
+  local OPTIND opt i
+  while getopts "ha:b:g:s:d:r:" opt; do
+    case $opt in
+      a)
+        START_DAY="$OPTARG"
+        #Checking if date is correct
+        date "+%Y-%m-%d" -d "$START_DAY" > /dev/null  2>&1
+          if [ $? != 0 ]
+            then
+              usage_error "after switch"
+          fi
+          ;;
+
+      b)
+        END_DAY="$OPTARG"
+        #Checking if date is correct
+        date "+%Y-%m-%d" -d "$END_DAY" > /dev/null  2>&1
+        if [ $? != 0 ]
+          then
+          usage_error "before switch"
+        fi
+        ;;
+
+      g)
+        if [ "$OPTARG" = "M" ]
+          then
+            GENDER="M"
+          elif [ "$OPTARG" = "Z" ]
+            then
+              GENDER='Z'
+            else
+              usage_error "gender switch"
+         fi
+        ;;
+
+      s)
+        GRAPH=true
+
+        case $OPTARG in
+           (*[!0-9]*|'') ((OPTIND--))
+                           continue
+                           ;;
+        esac
+
+        if [ "$OPTARG" -gt "0" ]
+          then
+            WIDTH="$OPTARG"
+        fi
+        ;;
+      h)
+        print_help
+        ;;
+      d)
+        [ ! -r $OPTARG ] && usage_error "File DISTRICS"
+        DISTRICS=$OPTARG
+        ;;
+      r)
+        [ ! -r $OPTARG ] && usage_error "File REGIONS"
+        REGIONS=$OPTARG
+        ;;
+      \?) usage_error "switches"
+        ;;
+    esac
+  done
+  shift $(( OPTIND - 1 ))
+  get_command "$@"
+}
+
+
+input_source(){
+  if [ "${SOURCE[0]}" = "" ]; then
+    if [ -t 0 ]; then
+      echo "id,datum,vek,pohlavi,kraj_nuts_kod,okres_lau_kod,nakaza_v_zahranici,nakaza_zeme_csu_kod,reportovano_khs"
+      exit
+    fi
+    cat /dev/stdin
+  elif [[ "${SOURCE[$i]}" = *".gz" ]]; then
+    zcat ${SOURCE[$i]}
+  elif [[ "${SOURCE[$i]}" = *".bz2" ]]; then
+    bzcat ${SOURCE[$i]}
+  else
+    sort -t , -k 2.1,2.4n -k 2.6,2.7n -k 2.9,3.10n ${SOURCE[$i]}
+  fi
+  return
+}
+
+# Main function for reading and distribution valid lines into commands
+get_line(){
+  i=0
+  while : ; do
+    input_source | while IFS=, read -r id datum vek pohlavi kraj_nuts_kod okres_lau_kod nakaza_v_zahranici nakaza_zeme_csu_kod reportovano_khs; do
+        #Removing head line
+        if [ "$datum" = "datum" ] && [ "$COMMAND" != "merge" ] ; then
+          if [ "$COMMAND" != "" ]; then
+            continue
+          fi
+        fi
+
+        #Switch -g -> GENDER
+        if [ "$GENDER" = "M" ] && [ "$pohlavi" = "Z" ]
+              then
+                continue
+          elif [ "$GENDER" = "Z" ] && [ "$pohlavi" = "M" ]
+            then
+              continue
+        fi
+
+
+        #Validating date                  #FUNCTION MOVED NOT CREATED !!! ->moved from daily|monthly|yearly
+        if [ "$datum" != "datum" ] && [ "$datum" != "" ]; then
+          date "+%Y-%m-%d" -d "$datum" > /dev/null  2>&1
+            if [ $? != 0 ] || [[ $datum != [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-3][0-9] ]] ; then
+              echo >&2 Invalid date: $id","$datum","$vek","$pohlavi","$kraj_nuts_kod","$okres_lau_kod","$nakaza_v_zahranici","$nakaza_zeme_csu_kod","$reportovano_khs
+              continue
+            fi
+        fi
+
+        #Validating age                   #FUNCTION MOVED NOT CREATED !!! ->moved from age
+        if [ "$vek" != "vek" ] && [ "$vek" != "" ]; then
+          case $vek in
+            (*[!0-9]*|'') >&2 echo Invalid age: $id","$datum","$vek","$pohlavi","$kraj_nuts_kod","$okres_lau_kod","$nakaza_v_zahranici","$nakaza_zeme_csu_kod","$reportovano_khs
+              continue
+              ((NONE++))
+            ;;
+          esac
+        fi
+
+        #Switch -a && -b  -> AFTER and BEFORE
+        if [[ "$datum" < "$START_DAY" ]]; then
+          continue
+        fi
+        if [[ "$datum" > "$END_DAY" ]] && [ "$datum" != "datum" ]; then
+          return
+        fi
+
+
+        case "$1" in
+          count_infected)
+            count_infected
+            ;;
+          count_age)
+            count_age
+            ;;
+
+          daily | monthly | yearly)
+            case "$1" in
+              daily)
+                count_days
+                ;;
+              monthly)
+                count_months
+                ;;
+              yearly)
+                count_years
+                ;;
+            esac
+            ;;
+
+          countries)
+            count_countries
+            ;;
+          districts)
+            count_districts
+            ;;
+          regions)
+            count_regions
+            ;;
+          merge)
+            if [ $i -gt 0 ] && [ "$datum" = "datum" ]
+              then
+                continue
+            fi
+            echo $id","$datum","$vek","$pohlavi","$kraj_nuts_kod","$okres_lau_kod","$nakaza_v_zahranici","$nakaza_zeme_csu_kod","$reportovano_khs
+            ;;
+        esac
+        done
+
+     ((i++))
+
+    if [ $i -ge ${#SOURCE[@]} ]
+    then
+      break
+    fi
+  done
+
+
+}
+
+count_infected(){
+  if [ "$pohlavi" = "M" ]
+    then
+      ((counter_man++))
+  elif [ "$pohlavi" = "Z" ]
+    then
+      ((counter_woman++))
+  else
+    ((NONE++))
+  fi
+}
+
+count_age(){
+
+  if [[ "$vek" = "" ]]; then
+    ((NONE++))
+  elif [[ "$vek" -lt 6 ]]; then
+    ((v05++))
+  elif [[ "$vek" -lt 16 ]]; then
+    ((v615++))
+  elif [[ "$vek" -lt 26 ]]; then
+    ((v1625++))
+  elif [[ "$vek" -lt 36 ]]; then
+    ((v2635++))
+  elif [[ "$vek" -lt 46 ]]; then
+    ((v3645++))
+  elif [[ "$vek" -lt 56 ]]; then
+    ((v4655++))
+  elif [[ "$vek" -lt 66 ]]; then
+    ((v5665++))
+  elif [[ "$vek" -lt 76 ]]; then
+    ((v6675++))
+  elif [[ "$vek" -lt 86 ]]; then
+    ((v7685++))
+  elif [[ "$vek" -lt 96 ]]; then
+    ((v8695++))
+  elif [[ "$vek" -lt 106 ]]; then
+    ((v96105++))
+  elif [[ "$vek" -gt 105 ]]; then
+    ((v105plus++))
+  fi
+
+}
+
+count_days(){
+
+  if [ "$previous_date" = "$datum" ]
+    then
+      ((date_value[$j]++))
+    else
+      ((j++))
+      dates[$j]="$datum"
+      ((date_value[$j]++))
+      previous_date=$datum
+  fi
+
+}
+
+count_months(){
+
+  month=$(echo $datum | cut -b 1-7)
+
+  if [[ "$month" = "$previous_date" ]]
+    then
+      ((date_value[$j]++))
+    else
+      ((j++))
+      dates[$j]="$month"
+      ((date_value[$j]++))
+      previous_date=$month
+  fi
+
+}
+
+count_years(){
+  year=$(echo $datum | cut -b 1-4)
+  if [[ "$year" = "$previous_date" ]]
+      then
+        ((date_value[$j]++))
+      else
+        ((j++))
+        dates[$j]="$year"
+        ((date_value[$j]++))
+        previous_date=$year
+    fi
+
+}
+
+
+count_countries(){
+
+  if [[ "$nakaza_zeme_csu_kod" = "" ]]
+    then
+      return
+  fi
+
+  for (( j = 0 ; j < ${#countries_id[@]}; j++ )); do
+    if [ "${countries_id[$j]}" = "$nakaza_zeme_csu_kod" ]
+      then
+        ((number[$j]++))
+        return
+    fi
+  done
+
+  if [[ "${countries_id[0]}" = "" ]]
+    then
+      countries_id[0]="$nakaza_zeme_csu_kod"
+      ((number[0]++))
+      return
+  fi
+
+
+  countries_id[$j]="$nakaza_zeme_csu_kod"
+  ((number[$j]++))
+
+}
+
+count_districts(){
+ if [[ "$okres_lau_kod" = "" ]]
+     then
+       ((NONE++))
+       return
+   fi
+
+   for (( j = 0 ; j < ${#district_id[@]}; j++ )); do
+     if [ "${district_id[$j]}" = "$okres_lau_kod" ]
+       then
+         ((number[$j]++))
+       return
+     fi
+   done
+
+   if [[ "${district_id[0]}" = "" ]]
+     then
+       district_id[0]="$okres_lau_kod"
+       ((number[0]++))
+       return
+   fi
+
+   district_id[$j]="$okres_lau_kod"
+   ((number[$j]++))
+}
+
+count_regions(){
+   if [[ "$kraj_nuts_kod" = "" ]]
+       then
+         ((NONE++))
+         return
+     fi
+
+     for (( j = 0 ; j < ${#regions_id[@]}; j++ )); do
+       if [ "${regions_id[$j]}" = "$kraj_nuts_kod" ]
+         then
+           ((number[$j]++))
+           return
+       fi
+     done
+
+     if [[ "${regions_id[0]}" = "" ]]
+       then
+         regions_id[0]="$kraj_nuts_kod"
+         ((number[0]++))
+         return
+     fi
+
+
+     regions_id[$j]="$kraj_nuts_kod"
+     ((number[$j]++))
+  }
+
+print_graph(){
+  local -n first_arr=$1
+  local -n second_arr=$2
+  local max="0"
+
+  if [[ "$NONE" -gt "0" ]]; then
+    first_arr[${#second_arr[@]}]="NONE"
+    second_arr[${#second_arr[@]}]="$NONE"
+  fi
+
+  # WIDTH = -1 -> switch -s without value
+  # Replacing values in arrays for amount of chars to draw
+  if [ $WIDTH != -1 ]; then
+    for (( i = 0; i < ${#second_arr[@]} ; i++ )); do
+        if [ "${second_arr[$i]}" = "" ]; then
+          second_arr[$i]="0"
+        fi
+        if [[ "${second_arr[$i]}" -gt "$max" ]]; then
+          max="${second_arr[$i]}"
+        fi
+    done
+    if [ $max = "0" ]; then
+      usage_error "graph draw"
+    fi
+    for (( i = 0; i < ${#second_arr[@]}; i++ )); do
+        let second_arr[$i]="$WIDTH*${second_arr[$i]}/$max"
+    done
+
+  else
+    for (( i = 0; i < ${#second_arr[@]}; i++ )); do
+      if [ "${second_arr[$i]}" = "" ]; then
+        second_arr[$i]="0"
+      fi
+      let second_arr[$i]="${second_arr[$i]}/$3"
+    done
+  fi
+
+  if [ "$DISTRICS" = "" ] && [ "$REGIONS" = "" ]; then
+    for (( i= 0; i < ${#second_arr[@]}; i++ )); do
+      echo -n "$(printf %-7s "${first_arr[$i]}") :  "
+      for (( j = 0; j < ${second_arr[$i]}; j++ )); do
+        echo -n "#"
+      done
+      echo
+    done
+  else
+    for (( i= 0; i < ${#second_arr[@]}; i++ )); do
+      echo -n "$(printf %-20s "${first_arr[$i]}") :  "
+      for (( j = 0; j < ${second_arr[$i]}; j++ )); do
+        echo -n "#"
+      done
+      echo
+    done
+  fi
+
+  exit
+}
+
+
+#-----------MAIN-------------#
+
+#Starting with separating switches, command and LOGS
+get_swtiches "$@"
+
+case $COMMAND in
+  infected)
+      get_line "count_infected"
+      if [[ $counter_none -gt 0 ]]
+        then
+          echo $(($counter_woman + $counter_man + $counter_none))
+        else
+          echo $((counter_woman + counter_man))
+      fi
+
+    ;;
+
+  gender)
+      get_line "count_infected"
+
+      if [ "$GRAPH" = "true" ]
+        then
+          genders=("M" "Z")
+          numbers=("$counter_man" "$counter_woman")
+          print_graph genders numbers "100000"  # <- number for divide without parameter -s
+          exit
+      else
+        echo "M: $counter_man"
+        echo "Z: $counter_woman"
+        if [[ "$NONE" -gt "0" ]]; then
+            echo NONE : "$NONE"
+        fi
+      fi
+    ;;
+
+  age)
+    get_line "count_age"
+    if [ "$GRAPH" = "true" ]
+      then
+        ages=("0-5" "6-15" "16-25" "26-35" "36-45" "46-55" "56-65" "66-75" "76-85" "86-95" "96-105" ">105")
+        numbers=("$v05" "$v615" "$v1625" "$v2635" "$v3645" "$v4655" "$v5665" "$v6675" "$v7685" "$v8695" "$v96105" "$v105plus")
+        print_graph ages numbers "10000"
+    else
+      echo "0-5   : $v05"
+      echo "6-15  : $v615"
+      echo 16-25 : $v1625
+      echo 26-35 : $v2635
+      echo 36-45 : $v3645
+      echo 46-55 : $v4655
+      echo 56-65 : $v5665
+      echo 66-75 : $v6675
+      echo 76-85 : $v7685
+      echo 86-95 : $v8695
+      echo 96-105: $v96105
+      echo ">105  : $v105plus"
+      if [[ "$NONE" -gt "0" ]]; then
+        echo "NONE  : $NONE"
+      fi
+    fi
+    ;;
+
+  daily)
+    j=-1
+
+    get_line "daily"
+
+    if [ "$GRAPH" = "true" ]
+      then
+        print_graph dates date_value "500"
+    else
+      for (( i = 0; i < ${#dates[@]}; i++ )); do
+          echo "${dates[$i]}: ${date_value[$i]}"
+      done
+      if [[ "$NONE" -gt "0" ]]; then
+        echo "NONE: $NONE"
+      fi
+    fi
+    ;;
+  monthly)
+    j=-1
+
+    get_line "monthly"
+
+    if [ "$GRAPH" = "true" ]
+      then
+        print_graph dates date_value "10000"
+      else
+        for (( i = 0; i < ${#dates[@]}; i++ )); do
+          echo "${dates[$i]}: ${date_value[$i]}"
+        done
+        if [[ "$NONE" -gt "0" ]]; then
+          echo "NONE: $NONE"
+        fi
+    fi
+    ;;
+
+  yearly)
+    j=0
+    get_line "yearly"
+
+    if [ "$GRAPH" = "true" ]
+      then
+        print_graph dates date_value "100000"
+    else
+      for (( i = 0; i < ${#dates[@]}; i++ )); do
+        echo "${dates[$i]}: ${date_value[$i]}"
+      done
+      if [[ "$NONE" -gt "0" ]]; then
+        echo "NONE: $NONE"
+      fi
+    fi
+    ;;
+
+  countries)
+    get_line "countries"
+
+    if [ "$GRAPH" = "true" ]
+          then
+            print_graph countries_id number "100"
+        else
+          for (( i = 0; i < ${#countries_id[@]}; i++ )); do
+            echo "${countries_id[$i]}: ${number[$i]}"
+          done
+        fi
+        ;;
+
+  districts)
+    get_line "districts"
+
+    if [[ "$DISTRICS" != "" ]]
+      then
+        for (( i = 0; i < ${#district_id[@]}; i++ )); do
+          while IFS=';' read Kod Nazev_okresu Zkratka_nazvu_okresu Kod_NUTS4_okresu Nazev_kraje
+            do
+              if [ "${district_id[$i]}" = "$(echo $Kod_NUTS4_okresu | cut -c 2-7)" ]
+                then
+                  district_id[$i]="$(echo ${Nazev_okresu:1:-1})"
+                  break
+              fi
+            done < $DISTRICS
+        done
+    fi
+
+    if [ "$GRAPH" = "true" ]
+      then
+        print_graph district_id number "1000"
+      else
+        for (( i = 0; i < ${#district_id[@]}; i++ )); do
+          echo "${district_id[$i]}: ${number[$i]}"
+        done
+        if [[ "$NONE" -gt "0" ]]; then
+          echo "NONE: $NONE"
+        fi
+    fi
+    ;;
+
+  regions)
+    get_line "regions"
+
+    if [[ "$REGIONS" != "" ]]
+          then
+            for (( i = 0; i < ${#regions_id[@]}; i++ )); do
+              while IFS=';' read Kod Nazev_kraje Zkratka_nazvu_kraje Kod_NUTS3_kraje Nazev_oblasti
+                do
+                  if [ "${regions_id[$i]}" = "$(echo $Kod_NUTS3_kraje | cut -c 2-6)" ]
+                    then
+                      regions_id[$i]="$(echo ${Nazev_kraje:1:-1})"
+                      break
+                  fi
+                done < $REGIONS
+            done
+        fi
+    if [ "$GRAPH" = "true" ]
+          then
+            print_graph regions_id number "10000"
+          else
+            for (( i = 0; i < ${#regions_id[@]}; i++ )); do
+              echo "${regions_id[$i]}: ${number[$i]}"
+            done
+            if [[ "$NONE" -gt "0" ]]; then
+              echo "NONE: $NONE"
+            fi
+        fi
+        ;;
+    merge)
+      get_line "merge"
+      ;;
+    *)
+      get_line "merge"
+      ;;
+esac
+
+
+
